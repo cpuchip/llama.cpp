@@ -219,6 +219,8 @@ static __device__ __forceinline__ void dequantize_tq3_1s(const void * vx, const 
 
     v.x = buf[iqs];
     v.y = buf[iqs + 1];
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the
