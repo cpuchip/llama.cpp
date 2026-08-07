@@ -14,9 +14,7 @@
 		INPUT_CLASSES,
 		SETTING_CONFIG_DEFAULT,
 		INITIAL_FILE_SIZE,
-		PROMPT_CONTENT_SEPARATOR,
-		PROMPT_TRIGGER_PREFIX,
-		RESOURCE_TRIGGER_PREFIX
+		PROMPT_CONTENT_SEPARATOR
 	} from '$lib/constants';
 	import {
 		ContentPartType,
@@ -39,8 +37,23 @@
 		activeConversation,
 		pendingCwd
 	} from '$lib/stores/conversations.svelte';
-	import type { GetPromptResult, MCPPromptInfo, MCPResourceInfo, PromptMessage } from '$lib/types';
-	import { isIMEComposing, parseClipboardContent, uuid } from '$lib/utils';
+	import type {
+		FileMentionEntry,
+		GetPromptResult,
+		MCPPromptInfo,
+		MCPResourceInfo,
+		PromptMessage
+	} from '$lib/types';
+	import {
+		buildMentionInsertion,
+		findCommandToken,
+		findMentionToken,
+		isIMEComposing,
+		mentionLinkEndingAt,
+		parseClipboardContent,
+		uuid
+	} from '$lib/utils';
+	import { useChatFormPickers } from '$lib/hooks/use-chat-form-pickers.svelte';
 	import {
 		AudioRecorder,
 		convertToWav,
@@ -96,30 +109,52 @@
 		onValueChange
 	}: Props = $props();
 
-	// Component References
 	let audioRecorder: AudioRecorder | undefined;
 	let chatFormActionsRef: ChatFormActions | undefined = $state(undefined);
 	let fileInputRef: ChatFormFileInputInvisible | undefined = $state(undefined);
 	let pickersRef: { handleKeydown: (event: KeyboardEvent) => boolean } | undefined =
 		$state(undefined);
-	let textareaRef: ChatFormTextarea | undefined = $state(undefined);
+	let inputRef: ChatFormTextarea | undefined = $state(undefined);
 
 	// Audio Recording State
 	let isRecording = $state(false);
 	let recordingSupported = $state(false);
 
-	// Picker State
-	let isPromptPickerOpen = $state(false);
-	let promptSearchQuery = $state('');
-	let isInlineResourcePickerOpen = $state(false);
-	let resourceSearchQuery = $state('');
+	// Invisible anchor at the form's top edge so the mention/WD popovers
+	// float above the box.
+	let mentionAnchor: HTMLDivElement | null = $state(null);
 
 	let cwd = $derived(activeConversation()?.cwd ?? pendingCwd());
 
-	async function handleWorkingDirectoryChange(value: string | null) {
-		await conversationsStore.setCwd(value);
+	const pickers = useChatFormPickers({
+		getValue: () => value,
+		setValue: (v) => {
+			value = v;
+			onValueChange?.(v);
+		},
+		getCaretOffset: () => inputRef?.getCaretOffset(),
+		setCaretOffset: (offset) => inputRef?.setCaretOffset(offset),
+		focusInput: refocusInput,
+		getShowModelSelector: () => showModelSelector,
+		hasPrompts: () => mcpStore.hasPromptsCapability(conversationsStore.getAllMcpServerOverrides()),
+		hasBuiltinTools: () => toolsStore.builtinTools.length > 0,
+		getCwd: () => cwd,
+		getServerHome: () => toolsStore.serverHome ?? null,
+		openModelSelector: () => chatFormActionsRef?.openModelSelector(),
+		getPickersRef: () => pickersRef
+	});
+
+	async function handleWorkingDirectoryChange(newDir: string | null) {
+		// Committing a directory consumes the `/cwd` token; the chip's
+		// clear-X path has no token to consume.
+		const token = findCommandToken(value);
+		if (token && token.name === 'cwd') {
+			value = '';
+			onValueChange?.('');
+		}
+		await conversationsStore.setCwd(newDir);
 		if (conversationsStore.activeConversation) {
-			await chatStore.recordCwdChange(value?.trim() || null);
+			await chatStore.recordCwdChange(newDir?.trim() || null);
 		}
 	}
 
@@ -171,18 +206,12 @@
 		audioRecorder = new AudioRecorder();
 	});
 
-	// Defer so the closing popover's focus scope tears down first - bits-ui
-	// yanks a synchronous focus() back into the still-mounted popover.
-	function refocusInput() {
-		queueMicrotask(() => textareaRef?.focus());
-	}
-
 	export function focus() {
-		textareaRef?.focus();
+		inputRef?.focus();
 	}
 
 	export function resetTextareaHeight() {
-		textareaRef?.resetHeight();
+		inputRef?.resetHeight();
 	}
 
 	export function openModelSelector() {
@@ -216,47 +245,26 @@
 		}
 	}
 
-	function handleInput() {
-		const perChatOverrides = conversationsStore.getAllMcpServerOverrides();
-		const hasServers = mcpStore.hasEnabledServers(perChatOverrides);
-
-		if (value.startsWith(PROMPT_TRIGGER_PREFIX) && hasServers) {
-			isPromptPickerOpen = true;
-			promptSearchQuery = value.slice(1);
-			isInlineResourcePickerOpen = false;
-			resourceSearchQuery = '';
-		} else if (
-			value.startsWith(RESOURCE_TRIGGER_PREFIX) &&
-			hasServers &&
-			mcpStore.hasResourcesCapability(perChatOverrides)
-		) {
-			isInlineResourcePickerOpen = true;
-			resourceSearchQuery = value.slice(1);
-			isPromptPickerOpen = false;
-			promptSearchQuery = '';
-		} else {
-			isPromptPickerOpen = false;
-			promptSearchQuery = '';
-			isInlineResourcePickerOpen = false;
-			resourceSearchQuery = '';
-		}
-	}
-
 	function handleKeydown(event: KeyboardEvent) {
-		if (pickersRef?.handleKeydown(event)) {
+		// Pickers consume navigation/escape keys first; when consumed, skip
+		// the enter-to-submit logic below.
+		if (pickers.handleKeydown(event)) {
 			return;
 		}
 
-		if (event.key === KeyboardKey.ESCAPE && isPromptPickerOpen) {
-			isPromptPickerOpen = false;
-			promptSearchQuery = '';
-			return;
-		}
-
-		if (event.key === KeyboardKey.ESCAPE && isInlineResourcePickerOpen) {
-			isInlineResourcePickerOpen = false;
-			resourceSearchQuery = '';
-			return;
+		// Backspace at a mention link's end deletes the whole token at once.
+		if (event.key === KeyboardKey.BACKSPACE && !event.ctrlKey && !event.metaKey && !event.altKey) {
+			const el = inputRef?.getElement();
+			if (el instanceof HTMLTextAreaElement && el.selectionStart === el.selectionEnd) {
+				const link = mentionLinkEndingAt(value, el.selectionStart);
+				if (link) {
+					event.preventDefault();
+					value = value.slice(0, link.start) + value.slice(link.end);
+					onValueChange?.(value);
+					queueMicrotask(() => inputRef?.setCaretOffset(link.start));
+					return;
+				}
+			}
 		}
 
 		if (event.key === KeyboardKey.ENTER && !event.shiftKey && !isIMEComposing(event)) {
@@ -332,7 +340,7 @@
 				}
 
 				setTimeout(() => {
-					textareaRef?.focus();
+					inputRef?.focus();
 				}, 10);
 
 				return;
@@ -359,13 +367,7 @@
 		promptInfo: MCPPromptInfo,
 		args?: Record<string, string>
 	) {
-		// Only clear the value if the prompt was triggered by typing '/'
-		if (value.startsWith(PROMPT_TRIGGER_PREFIX)) {
-			value = '';
-			onValueChange?.('');
-		}
-		isPromptPickerOpen = false;
-		promptSearchQuery = '';
+		pickers.closePromptPicker();
 
 		const promptName = promptInfo.title || promptInfo.name;
 		const placeholder: ChatUploadedFile = {
@@ -384,7 +386,7 @@
 
 		uploadedFiles = [...uploadedFiles, placeholder];
 		onUploadedFilesChange?.(uploadedFiles);
-		textareaRef?.focus();
+		inputRef?.focus();
 	}
 
 	function handlePromptLoadComplete(placeholderId: string, result: GetPromptResult) {
@@ -426,39 +428,30 @@
 		onUploadedFilesChange?.(uploadedFiles);
 	}
 
-	function handlePromptPickerClose() {
-		isPromptPickerOpen = false;
-		promptSearchQuery = '';
-		textareaRef?.focus();
+	// Deferred so the closing popover's focus scope tears down first -
+	// bits-ui yanks a synchronous focus() back into the still-mounted popover.
+	function refocusInput() {
+		queueMicrotask(() => inputRef?.focus());
 	}
 
-	function handleInlineResourcePickerClose() {
-		isInlineResourcePickerOpen = false;
-		resourceSearchQuery = '';
-		textareaRef?.focus();
-	}
+	// Splice the mention link in place of the `@<query>` token. Uses the
+	// live cursor, not a stale snapshot - the token may have been edited.
+	function handleMentionSelect(entry: FileMentionEntry) {
+		const cursor = inputRef?.getCaretOffset() ?? value.length;
+		const token = findMentionToken(value, cursor);
+		if (!token) return;
 
-	function handleInlineResourceSelect() {
-		if (value.startsWith(RESOURCE_TRIGGER_PREFIX)) {
-			value = '';
-			onValueChange?.('');
-		}
+		const built = buildMentionInsertion(entry, value, token);
+		if (!built) return;
 
-		isInlineResourcePickerOpen = false;
-		resourceSearchQuery = '';
-		textareaRef?.focus();
-	}
+		value = built.newValue;
+		onValueChange?.(built.newValue);
 
-	function handleBrowseResources() {
-		isInlineResourcePickerOpen = false;
-		resourceSearchQuery = '';
-
-		if (value.startsWith(RESOURCE_TRIGGER_PREFIX)) {
-			value = '';
-			onValueChange?.('');
-		}
-
-		isResourceDialogOpen = true;
+		// bind:value applies on the next microtask; restore the caret after.
+		queueMicrotask(() => {
+			inputRef?.focus();
+			inputRef?.setCaretOffset(built.caretOffset);
+		});
 	}
 
 	async function handleMicClick() {
@@ -503,18 +496,31 @@
 >
 	<ChatFormPickers
 		bind:this={pickersRef}
-		{isPromptPickerOpen}
-		{promptSearchQuery}
-		{isInlineResourcePickerOpen}
-		{resourceSearchQuery}
-		onPromptPickerClose={handlePromptPickerClose}
-		onInlineResourcePickerClose={handleInlineResourcePickerClose}
-		onInlineResourceSelect={handleInlineResourceSelect}
+		isCommandPickerOpen={pickers.isCommandPickerOpen}
+		commandQuery={pickers.commandQuery}
+		commands={pickers.availableCommands}
+		onCommandPickerClose={pickers.handleCommandPickerClose}
+		onCommandSelect={pickers.handleCommandSelect}
+		isPromptPickerOpen={pickers.isPromptPickerOpen}
+		promptSearchQuery={pickers.promptSearchQuery}
+		isMentionPickerOpen={pickers.isMentionPickerOpen}
+		mentionQuery={pickers.mentionQuery}
+		{mentionAnchor}
+		scopePath={pickers.mentionScopePath}
+		onPromptPickerClose={pickers.handlePromptPickerClose}
+		onMentionPickerClose={pickers.handleMentionPickerClose}
+		onMentionOpened={() => inputRef?.focus()}
+		onMentionSelect={handleMentionSelect}
 		onPromptLoadStart={handlePromptLoadStart}
 		onPromptLoadComplete={handlePromptLoadComplete}
 		onPromptLoadError={handlePromptLoadError}
-		onInlineResourceBrowse={handleBrowseResources}
 	/>
+
+	<div
+		bind:this={mentionAnchor}
+		class="pointer-events-none absolute top-0 right-0 left-0 h-px"
+		aria-hidden="true"
+	></div>
 
 	<div
 		class="{INPUT_CLASSES} overflow-hidden rounded-4xl md:rounded-3xl backdrop-blur-md {disabled
@@ -534,17 +540,17 @@
 
 		<div
 			class="flex-column relative min-h-12 items-center rounded-4xl md:rounded-3xl py-2 pb-2.25 shadow-sm transition-all focus-within:shadow-md md:py-3!"
-			onpaste={handlePaste}
 		>
 			<ChatFormTextarea
 				class="px-5 py-1.5 md:pt-0"
-				bind:this={textareaRef}
+				bind:this={inputRef}
 				bind:value
 				onKeydown={handleKeydown}
 				onInput={() => {
-					handleInput();
+					pickers.handleInput();
 					onValueChange?.(value);
 				}}
+				onPaste={handlePaste}
 				{disabled}
 				{placeholder}
 			/>
@@ -574,7 +580,7 @@
 				onMicClick={handleMicClick}
 				{onStop}
 				onSystemPromptClick={() => onSystemPromptClick?.({ message: value, files: uploadedFiles })}
-				onMcpPromptClick={showMcpPromptButton ? () => (isPromptPickerOpen = true) : undefined}
+				onMcpPromptClick={showMcpPromptButton ? () => pickers.openPromptPicker() : undefined}
 				onMcpResourcesClick={() => (isResourceDialogOpen = true)}
 			/>
 		</div>
@@ -585,8 +591,12 @@
 	{#if toolsStore.builtinTools.length > 0}
 		<ChatFormWorkingDirectory
 			directory={cwd}
+			isOpen={pickers.isWorkingDirectoryPickerOpen}
+			bind:query={pickers.workingDirectoryQuery}
+			customAnchor={mentionAnchor}
 			onChange={handleWorkingDirectoryChange}
-			onClose={refocusInput}
+			onClose={pickers.handleWorkingDirectoryClose}
+			onOpen={pickers.handleWorkingDirectoryOpen}
 			{disabled}
 		/>
 	{/if}
