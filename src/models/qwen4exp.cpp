@@ -844,7 +844,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             nullptr, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+            // MoE expert cache: the laguna wiring (8e5bc28c7), pointed at qwen4exp.
+            // The cache only engages when use_moe_packs holds, and it does here --
+            // verified from the GGUF, not assumed: this checkpoint has ffn_{gate,up,
+            // down}_exps and NO fused ffn_gate_up_exps, no *_exps_s scales, no expert
+            // biases; the call is LLM_FFN_SILU; weight_before_ffn is LLAMA4-only; and
+            // swiglu_clamp_exp stays 0. Miss any one and the cache is a silent no-op.
+            /* selected_experts_in */ nullptr, &model.layers[il]);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation
