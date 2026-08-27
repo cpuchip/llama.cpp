@@ -1875,6 +1875,17 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    // PORT GAP between the MoE expert cache and newer upstream CUDA, found by the assert at
+    // the single caller. The cache's dual pack chains set op_params[0]=1 ("ids may contain
+    // -1"), which disqualifies BOTH fast paths above the caller's assert -- so the op does
+    // reach the sync path. But this predicate was written assuming ids_may_skip is never
+    // set, and answers "no sync needed" for a small quantized batch, so the assert fires.
+    // The caller has already established the fast paths are unavailable; saying so here is
+    // agreeing with it, not overriding it.
+    if (dst->op_params[0] != 0) {
+        return true;
+    }
+
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
     }
