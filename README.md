@@ -89,10 +89,19 @@ nothing to apply to. Ready when you take the sync:
 **The caveat:** on `qwen4exp` the cached output is **not** bit-identical to baseline. At
 temperature 0 it diverges from the uncached build — coherent, on-topic, consistent with a
 single argmax flip, which is what float non-associativity between one fused chain and two
-summed pack chains would produce. **Quality is unaffected as far as a proper test can tell**:
-paired over the same 64 chunks, ΔPPL is **+0.047% (t = +0.88), below that test's own 0.107%
-detection floor**, with the cached arm's peak VRAM confirming it engaged rather than silently
-no-op'ing. The claim that holds on this architecture is *statistically indistinguishable*, not
+summed pack chains would produce. **Quality is unaffected, on two corpora with opposite signs**:
+paired over 64 chunks each, with the cached arm's peak VRAM (15,544 MiB vs 6,286) confirming
+it engaged rather than silently no-op'ing —
+
+| corpus | baseline PPL | cache-64 ΔPPL | t | detection floor |
+| --- | --- | --- | --- | --- |
+| technical prose (NASA SP-4205 OCR) | 8.2438 | **−0.047%** | −0.85 | 0.112% |
+| *Pride and Prejudice* | 1.0594 | +0.113% | +1.68 | 0.107% |
+
+Neither is detectable, and **the sign flips between corpora** — a real quality cost would keep
+its sign. The Austen row is included only for completeness: at PPL 1.06 the model is
+near-certain of every token, which we take as memorisation rather than a usable discriminator,
+and it is why the technical corpus was run as a control. The claim that holds on this architecture is *statistically indistinguishable*, not
 *bit-identical* — worth softening the wording above for architectures beyond the three you
 measured.
 
